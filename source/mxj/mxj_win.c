@@ -1,6 +1,7 @@
 #include <windows.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 
@@ -210,10 +211,10 @@ FreeKnownVMs()
 /*
  * Prototypes.
  */
-static jboolean GetPublicJREHome(char *path, jint pathsize);
+
 static jboolean GetJVMPath(const char *jrepath, const char *jvmtype,
 			   char *jvmpath, jint jvmpathsize);
-static jboolean GetJREPath(char *path, jint pathsize);
+static jboolean GetJREPath(char *path, jint pathsize, const char *directJrePath);
 
 const char *
 GetArch()
@@ -272,7 +273,7 @@ CreateExecutionEnvironment(
     struct stat s;
 
     /* Find out where the JRE is that we will be using. */
-    if (!GetJREPath(jrepath, so_jrepath)) {
+    if (!GetJREPath(jrepath, so_jrepath, NULL)) {
 		ReportErrorMessage("could not find Java 2 Runtime Environment.",JNI_TRUE);
 		return 2;
     }
@@ -322,42 +323,44 @@ CreateExecutionEnvironment(
 }
 
 /*
- * Find path to JRE based on .exe's location (embeded into application)
- * or registry settings (installed in the computer programs)
+ * Finds the path to a valid JRE/JDK.
+ * Checks the JAVA_HOME environment variable first, then an optional direct path.
+ * Returns 1 on success and copies the path into path.
+ * Returns 0 on failure.
  */
 jboolean
-GetJREPath(char *path, jint pathsize)
+GetJREPath(char *path, jint pathsize, const char *directJrePath)
 {
-    char javadll[MAXPATHLEN];
     struct stat s;
+    char javadll[MAXPATHLEN];
 
-    if (GetApplicationHome(path, pathsize)) {
-	/* Is JRE co-located with the application? */
-	sprintf(javadll, "%s\\bin\\" JAVA_DLL, path);
-	if (stat(javadll, &s) == 0) {
-	    goto found;
-	}
-
-	/* Does this app ship a private JRE in <apphome>\jre directory? */
-	sprintf(javadll, "%s\\jre\\bin\\" JAVA_DLL, path);
-	if (stat(javadll, &s) == 0) {
-	    strcat(path, "\\jre");
-	    goto found;
-	}
+    // 1. Check JAVA_HOME environment variable
+    const char *java_home = getenv("JAVA_HOME");
+    if (java_home != NULL && strlen(java_home) > 0) {
+        // Check if JAVA_HOME points to a valid JRE/JDK (contains bin\jvm.dll)
+        snprintf(javadll, sizeof(javadll), "%s\\bin\\%s", java_home, JVM_DLL);
+        if (stat(javadll, &s) == 0) {
+            strncpy(path, java_home, pathsize);
+            if (debug)
+                post("JRE path from JAVA_HOME is %s\n", path);
+            return JNI_TRUE;
+        }
     }
 
-    /* Look for a public JRE on this machine. */
-    if (GetPublicJREHome(path, pathsize)) {
-	goto found;
+    // 2. Check direct path argument, if provided
+    if (directJrePath != NULL && strlen(directJrePath) > 0) {
+        snprintf(javadll, sizeof(javadll), "%s\\bin\\%s", directJrePath, JVM_DLL);
+        if (stat(javadll, &s) == 0) {
+            strncpy(path, directJrePath, pathsize);
+            if (debug)
+                post("JRE path from direct path is %s\n", path);
+            return JNI_TRUE;
+        }
     }
 
-    fprintf(stderr, "Error: could not find " JAVA_DLL "\n");
+    // 3. Failure: could not find a valid JRE/JDK
+    fprintf(stderr, "Error: JAVA_HOME not set or invalid, and direct JRE path not provided or invalid.\n");
     return JNI_FALSE;
-
- found:
-    if (debug)
-      post("JRE path is %s\n", path);
-    return JNI_TRUE;
 }
 
 /*
@@ -435,80 +438,6 @@ GetApplicationHome(char *buf, jint bufsize)
 	return 1;
 }
 
-
-/*
- * Helpers to look in the registry for a public JRE.
- */
-#define DOTRELEASE  JDK_MAJOR_VERSION "." JDK_MINOR_VERSION
-#define JRE_KEY	    "Software\\JavaSoft\\Java Runtime Environment"
-
-static jboolean
-GetStringFromRegistry(HKEY key, const char *name, char *buf, jint bufsize)
-{
-    DWORD type, size;
-
-    if (RegQueryValueEx(key, name, 0, &type, 0, &size) == 0
-	&& type == REG_SZ
-	&& (size < (unsigned int)bufsize)) {
-	if (RegQueryValueEx(key, name, 0, 0, buf, &size) == 0) {
-	    return JNI_TRUE;
-	}
-    }
-    return JNI_FALSE;
-}
-
-static jboolean
-GetPublicJREHome(char *buf, jint bufsize)
-{
-    HKEY key, subkey;
-    char version[MAXPATHLEN];
-
-    /* Find the current version of the JRE */
-    if (RegOpenKeyEx(HKEY_LOCAL_MACHINE, JRE_KEY, 0, KEY_READ, &key) != 0) {
-	fprintf(stderr, "Error opening registry key '" JRE_KEY "'\n");
-	return JNI_FALSE;
-    }
-
-    if (!GetStringFromRegistry(key, "CurrentVersion", version, sizeof(version))) {
-		fprintf(stderr, "Failed reading value of registry key:\n\t" JRE_KEY "\\CurrentVersion\n");
-	RegCloseKey(key);
-	return JNI_FALSE;
-    }
-/* currently don't require a minimum version...revisit-jkc
-    if (strcmp(version, DOTRELEASE) != 0) {
-	fprintf(stderr, "Registry key '" JRE_KEY "\\CurrentVersion'\nhas "
-		"value '%s', but '" DOTRELEASE "' is required.\n", version);
-	RegCloseKey(key);
-	return JNI_FALSE;
-    }
-*/
-    /* Find directory where the current version is installed. */
-    if (RegOpenKeyEx(key, version, 0, KEY_READ, &subkey) != 0) {
-		fprintf(stderr, "Error opening registry key '" JRE_KEY "\\%s'\n", version);
-	RegCloseKey(key);
-	return JNI_FALSE;
-    }
-
-    if (!GetStringFromRegistry(subkey, "JavaHome", buf, bufsize)) {
-		fprintf(stderr, "Failed reading value of registry key:\n\t" JRE_KEY "\\%s\\JavaHome\n", version);
-	RegCloseKey(key);
-	RegCloseKey(subkey);
-	return JNI_FALSE;
-    }
-
-    if (debug) {
-	char micro[MAXPATHLEN];
-		if (!GetStringFromRegistry(subkey, "MicroVersion", micro, sizeof(micro))) {
-			ReportErrorMessage("Warning: Can't read MicroVersion\n", true);
-	    micro[0] = '\0';
-	}
-		post("Version major.minor.micro = %s.%s\n", version, micro);
-    }
-
-    RegCloseKey(key);
-    RegCloseKey(subkey);
-    return JNI_TRUE;
-}
 
 /*
  * Support for doing cheap, accurate interval timing.
